@@ -54,6 +54,12 @@ namespace be_wrk_orchestrator
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqWriterQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResWriterQueue);
 
+                // Purge all queues before starting orchestration
+                _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqFeederQueue);
+                _rabbitMqService.PurgeQueue(RabbitMqConfig.ResFeederQueue);
+                _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqWriterQueue);
+                _rabbitMqService.PurgeQueue(RabbitMqConfig.ResWriterQueue);
+
                 // Set up Consumers:
                 _rabbitMqService.Consume<FeederResponse>(RabbitMqConfig.ResFeederQueue, OnFeederResponseReceived, autoAck: false);
                 _rabbitMqService.Consume<WriterResponse>(RabbitMqConfig.ResWriterQueue, OnWriterResponseReceived, autoAck: false);
