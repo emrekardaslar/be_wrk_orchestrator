@@ -67,43 +67,8 @@ namespace be_wrk_orchestrator
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for feeder responses on '{RabbitMqConfig.ResFeederQueue}'");
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for writer responses on '{RabbitMqConfig.ResWriterQueue}'");
 
-                // Initiate the workflow by sending FeederCommand on startup ---
-                var initialCorrelationId = Guid.NewGuid();
-                var initialFeederCommand = new FeederCommand
-                {
-                    CorrelationId = initialCorrelationId,
-                    CommandType = $"StartupProcess_{DateTime.Now:yyyyMMddHHmmss}", // A dynamic type for the initial command
-                    // You can add more initial data here if needed, e.g., RequestData = "some_data_from_startup_config"
-                };
-
-                // Create the initial OrchestrationState before sending the command
-                var initialState = new OrchestrationState
-                {
-                    // If you want to store the command that kicked it off: InitialCommand = initialFeederCommand,
-                    CurrentStep = "Orchestrator Initiating Feeder Command"
-                };
-                _orchestrationStates.TryAdd(initialCorrelationId.ToString(), initialState);
-
-                // Publish the initial FeederCommand asynchronously.
-                // Using .ContinueWith to log success/failure of this initial publish attempt.
-                _ = _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, initialFeederCommand)
-                    .ContinueWith(task => {
-                        if (task.IsFaulted)
-                        {
-                            _logger.LogError(task.Exception, $"be_wrk_orchestrator: [!] Error publishing initial FeederCommand for CorrelationId: {initialCorrelationId}");
-                            // Optionally, update the state to failed if the initial command couldn't be sent
-                            if (_orchestrationStates.TryGetValue(initialCorrelationId.ToString(), out var failedState))
-                            {
-                                failedState.IsCompleted = true;
-                                failedState.IsSuccessful = false;
-                                failedState.ErrorMessage = "Failed to publish initial FeederCommand";
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogInformation($"be_wrk_orchestrator: [->] Initial FeederCommand with CorrelationId: {initialCorrelationId} published to '{RabbitMqConfig.ReqFeederQueue}' on startup.");
-                        }
-                    });
+                // Use the helper for the initial orchestration
+                _ = StartNewOrchestration($"StartupProcess_{DateTime.Now:yyyyMMddHHmmss}");
             }
             catch (Exception ex)
             {
@@ -265,22 +230,8 @@ namespace be_wrk_orchestrator
                 _logger.LogInformation($"be_wrk_orchestrator: [->] Orchestration process completed for CorrelationId: {correlationIdString}. Final response not published to a dedicated orchestrator queue as per design.");
                 _rabbitMqService.Ack(context.DeliveryTag); // Acknowledge writer response message
 
-                // [NEW] Start the process again after writer finishes
-                var newCorrelationId = Guid.NewGuid();
-                var newFeederCommand = new FeederCommand
-                {
-                    CorrelationId = newCorrelationId,
-                    CommandType = $"ChainedProcess_{DateTime.Now:yyyyMMddHHmmss}",
-                    // Optionally, add more data here if needed
-                };
-                var newState = new OrchestrationState
-                {
-                    CurrentStep = "Orchestrator Initiating Feeder Command"
-                };
-                _orchestrationStates.TryAdd(newCorrelationId.ToString(), newState);
-
-                await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, newFeederCommand);
-                _logger.LogInformation($"be_wrk_orchestrator: [->] Chained FeederCommand with CorrelationId: {newCorrelationId} published to '{RabbitMqConfig.ReqFeederQueue}' after Writer completed.");
+                // Use the helper for the next orchestration
+                await StartNewOrchestration($"ChainedProcess_{DateTime.Now:yyyyMMddHHmmss}");
             }
             catch (Exception ex)
             {
@@ -329,6 +280,23 @@ namespace be_wrk_orchestrator
                 _logger.LogWarning($"be_wrk_orchestrator: Tried to handle failure for unknown or already processed CorrelationId: {correlationId}. Nacking current message.");
                 _rabbitMqService.Nack(deliveryTag, requeueOriginal); // Still nack the message even if state not found
             }
+        }
+
+        private async Task StartNewOrchestration(string commandType)
+        {
+            var correlationId = Guid.NewGuid();
+            var feederCommand = new FeederCommand
+            {
+                CorrelationId = correlationId,
+                CommandType = commandType
+            };
+            var state = new OrchestrationState
+            {
+                CurrentStep = "Orchestrator Initiating Feeder Command"
+            };
+            _orchestrationStates.TryAdd(correlationId.ToString(), state);
+            await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, feederCommand);
+            _logger.LogInformation($"be_wrk_orchestrator: [->] FeederCommand with CorrelationId: {correlationId} published to '{RabbitMqConfig.ReqFeederQueue}'.");
         }
     }
 }
