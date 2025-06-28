@@ -258,6 +258,23 @@ namespace be_wrk_orchestrator
                 // It's currently not being sent externally.
                 _logger.LogInformation($"be_wrk_orchestrator: [->] Orchestration process completed for CorrelationId: {correlationIdString}. Final response not published to a dedicated orchestrator queue as per design.");
                 _rabbitMqService.Ack(context.DeliveryTag); // Acknowledge writer response message
+
+                // [NEW] Start the process again after writer finishes
+                var newCorrelationId = Guid.NewGuid();
+                var newFeederCommand = new FeederCommand
+                {
+                    CorrelationId = newCorrelationId,
+                    CommandType = $"ChainedProcess_{DateTime.Now:yyyyMMddHHmmss}",
+                    // Optionally, add more data here if needed
+                };
+                var newState = new OrchestrationState
+                {
+                    CurrentStep = "Orchestrator Initiating Feeder Command"
+                };
+                _orchestrationStates.TryAdd(newCorrelationId.ToString(), newState);
+
+                await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, newFeederCommand);
+                _logger.LogInformation($"be_wrk_orchestrator: [->] Chained FeederCommand with CorrelationId: {newCorrelationId} published to '{RabbitMqConfig.ReqFeederQueue}' after Writer completed.");
             }
             catch (Exception ex)
             {
