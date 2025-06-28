@@ -31,19 +31,15 @@ namespace be_wrk_orchestrator
         // Represents the state of an ongoing orchestration workflow
         private class OrchestrationState
         {
-            // InitialCommand will now refer to the *triggering* message, which might be a FeederResponse,
-            // as OrchestratorCommand is no longer directly consumed by the orchestrator.
-            // For now, keeping it as OrchestratorCommand? but note its role has changed conceptually.
-            public OrchestratorCommand? InitialCommand { get; set; }
             public FeederResponse? FeederResponse { get; set; }
             public DateTime StartTime { get; } = DateTime.UtcNow;
             public string CurrentStep { get; set; } = "Initialized";
             public bool IsCompleted { get; set; } = false;
             public bool IsSuccessful { get; set; } = false;
             public string? ErrorMessage { get; set; }
-            // If the orchestrator is to send a final response, it needs a ReplyTo address.
-            // This would ideally come from the *initial trigger message*.
-            // public string? ReplyToQueue { get; set; } // This would require a library change if BaseMessage/FeederResponse doesn't have it.
+            // As discussed, OrchestratorResponse publishing needs a ReplyToQueue,
+            // which would ideally come from an initial trigger message.
+            // Since Orchestrator initiates, there's no external ReplyToQueue to use unless hardcoded.
         }
 
         public override Task StartAsync(CancellationToken cancellationToken)
@@ -52,20 +48,56 @@ namespace be_wrk_orchestrator
 
             try
             {
-                // The orchestrator needs to know about these queues to send commands and receive responses.
+                // Declare queues for services it interacts with (Feeder, Writer)
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqFeederQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResFeederQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqWriterQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResWriterQueue);
 
-                // Consume responses from the Feeder service (this will now be the primary entry/reaction point)
+                // Set up Consumers:
                 _rabbitMqService.Consume<FeederResponse>(RabbitMqConfig.ResFeederQueue, OnFeederResponseReceived, autoAck: false);
-                // Consume responses from the Writer service
                 _rabbitMqService.Consume<WriterResponse>(RabbitMqConfig.ResWriterQueue, OnWriterResponseReceived, autoAck: false);
-
 
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for feeder responses on '{RabbitMqConfig.ResFeederQueue}'");
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for writer responses on '{RabbitMqConfig.ResWriterQueue}'");
+
+                // Initiate the workflow by sending FeederCommand on startup ---
+                var initialCorrelationId = Guid.NewGuid();
+                var initialFeederCommand = new FeederCommand
+                {
+                    CorrelationId = initialCorrelationId,
+                    CommandType = $"StartupProcess_{DateTime.Now:yyyyMMddHHmmss}", // A dynamic type for the initial command
+                    // You can add more initial data here if needed, e.g., RequestData = "some_data_from_startup_config"
+                };
+
+                // Create the initial OrchestrationState before sending the command
+                var initialState = new OrchestrationState
+                {
+                    // If you want to store the command that kicked it off: InitialCommand = initialFeederCommand,
+                    CurrentStep = "Orchestrator Initiating Feeder Command"
+                };
+                _orchestrationStates.TryAdd(initialCorrelationId.ToString(), initialState);
+
+                // Publish the initial FeederCommand asynchronously.
+                // Using .ContinueWith to log success/failure of this initial publish attempt.
+                _ = _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, initialFeederCommand)
+                    .ContinueWith(task => {
+                        if (task.IsFaulted)
+                        {
+                            _logger.LogError(task.Exception, $"be_wrk_orchestrator: [!] Error publishing initial FeederCommand for CorrelationId: {initialCorrelationId}");
+                            // Optionally, update the state to failed if the initial command couldn't be sent
+                            if (_orchestrationStates.TryGetValue(initialCorrelationId.ToString(), out var failedState))
+                            {
+                                failedState.IsCompleted = true;
+                                failedState.IsSuccessful = false;
+                                failedState.ErrorMessage = "Failed to publish initial FeederCommand";
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogInformation($"be_wrk_orchestrator: [->] Initial FeederCommand with CorrelationId: {initialCorrelationId} published to '{RabbitMqConfig.ReqFeederQueue}' on startup.");
+                        }
+                    });
             }
             catch (Exception ex)
             {
@@ -101,13 +133,9 @@ namespace be_wrk_orchestrator
             return base.StopAsync(cancellationToken);
         }
 
-        // Removed: OnOrchestratorCommandReceived method entirely, as there's no dedicated queue for it.
-        // The initial trigger for an orchestration will now need to come from a FeederResponse (or similar).
-
         /// <summary>
-        /// Handler for responses from the Feeder Service. Decides next step (Writer or Fail).
-        /// This method might also need to act as the *initial trigger* for new orchestrations
-        /// if FeederResponse carries a special "start orchestration" signal.
+        /// Handler for responses from the Feeder Service.
+        /// This method will now always receive a response for an orchestration initiated by the orchestrator itself.
         /// </summary>
         private async Task OnFeederResponseReceived(FeederResponse? response, MessageDeliveryContext context)
         {
@@ -121,38 +149,18 @@ namespace be_wrk_orchestrator
 
             // Convert CorrelationId (Guid) to string for dictionary lookup and logging
             string correlationIdString = response.CorrelationId.ToString();
+            OrchestrationState? state;
 
-            // --- NEW ORCHESTRATION INITIATION LOGIC (Conceptual) ---
-            // If this FeederResponse is meant to *start* a new orchestration,
-            // you'd add logic here to check for that condition.
-            // Example: if (response.CommandType == "InitiateOrchestration" && !_orchestrationStates.ContainsKey(correlationIdString))
-            // {
-            //     _logger.LogInformation($"be_wrk_orchestrator: [x] Initiating new Orchestration from FeederResponse (CorrelationId: {correlationIdString})");
-            //     var state = new OrchestrationState { FeederResponse = response, CurrentStep = "Requesting Writer Data" };
-            //     _orchestrationStates.TryAdd(correlationIdString, state);
-            //     // Then proceed to publish WriterCommand based on response.FetchedData
-            // }
-            // else
-            // {
-            //     // Existing logic for continuing an ongoing orchestration
-            // }
-            // --- END NEW ORCHESTRATION INITIATION LOGIC ---
-
-
-            // Retrieve the ongoing orchestration state
-            // NOTE: If FeederResponse now *starts* the orchestration, then TryGetValue will initially fail.
-            // You need logic above to add the state if it's a new orchestration.
-            if (!_orchestrationStates.TryGetValue(correlationIdString, out var state))
+            // The state *should* now always exist because the orchestrator initiated it in StartAsync.
+            // If it doesn't, it indicates an unexpected message or an issue.
+            if (!_orchestrationStates.TryGetValue(correlationIdString, out state))
             {
-                // For now, assume it's always meant to be part of an ongoing flow.
-                // If this FeederResponse is truly the *start*, then this warning might be expected for the first message.
-                // Revisit this logic based on how orchestrations are actually initiated.
-                 _logger.LogWarning($"be_wrk_orchestrator: [!] Received FeederResponse for unknown CorrelationId: {correlationIdString}. This might be an initial trigger or an out-of-sequence response. Nacking for now.");
-                 _rabbitMqService.Nack(context.DeliveryTag, requeue: false);
-                 return;
+                _logger.LogWarning($"be_wrk_orchestrator: [!] Received FeederResponse for unknown CorrelationId: {correlationIdString}. This should only happen if another service initiated it or after completion. Nacking.");
+                _rabbitMqService.Nack(context.DeliveryTag, requeue: false);
+                return;
             }
 
-            _logger.LogInformation($"be_wrk_orchestrator: [<-] Received FeederResponse for CorrelationId: {correlationIdString}. IsSuccess: {response.IsSuccess}");
+            _logger.LogInformation($"be_wrk_orchestrator: [<-] Received FeederResponse for CorrelationId: {correlationIdString}. IsSuccess: {response.IsSuccess}. Current Step: {state.CurrentStep}");
 
             state.FeederResponse = response; // Store feeder response in state
             state.CurrentStep = "Processing Feeder Response";
@@ -222,12 +230,12 @@ namespace be_wrk_orchestrator
             state.IsCompleted = true;
             state.CurrentStep = "Completed";
 
-            var orchestrationResponse = new OrchestratorResponse // Changed local variable name to avoid conflict with type name
+            var orchestrationResponse = new OrchestratorResponse
             {
-                CorrelationId = response.CorrelationId, // CorrelationId on OrchestrationResponse should match the Guid type
+                CorrelationId = response.CorrelationId,
                 IsSuccess = response.IsSuccess,
                 FinalMessage = response.IsSuccess ? "Orchestration completed successfully." : "Orchestration failed at writer step.",
-                PersistedItemId = response.PersistedItemId, // Pass along the ID from writer
+                PersistedItemId = response.PersistedItemId,
                 ErrorDetails = response.ErrorMessage
             };
 
@@ -245,8 +253,11 @@ namespace be_wrk_orchestrator
 
             try
             {
-                _rabbitMqService.Ack(context.DeliveryTag); // Acknowledge writer response message
+                // As discussed, the OrchestratorResponse is not published to a dedicated queue
+                // and lacks a ReplyToQueue property in BaseMessage to send dynamically.
+                // It's currently not being sent externally.
                 _logger.LogInformation($"be_wrk_orchestrator: [->] Orchestration process completed for CorrelationId: {correlationIdString}. Final response not published to a dedicated orchestrator queue as per design.");
+                _rabbitMqService.Ack(context.DeliveryTag); // Acknowledge writer response message
             }
             catch (Exception ex)
             {
@@ -272,10 +283,10 @@ namespace be_wrk_orchestrator
                 // Nack the current message that triggered the failure (e.g., failed FeederResponse)
                 _rabbitMqService.Nack(deliveryTag, requeueOriginal);
 
-                // Publish a final failure response
-                var orchestrationResponse = new OrchestratorResponse // Changed local variable name to avoid conflict with type name
+                // Publish a final failure response (currently not sent externally as per design constraints)
+                var orchestrationResponse = new OrchestratorResponse
                 {
-                    CorrelationId = Guid.Parse(correlationId), // Convert string back to Guid for the message property
+                    CorrelationId = Guid.Parse(correlationId),
                     IsSuccess = false,
                     FinalMessage = "Orchestration failed due to an internal error or a step failure.",
                     ErrorDetails = errorMessage
