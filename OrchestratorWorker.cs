@@ -49,26 +49,26 @@ namespace be_wrk_orchestrator
                 // Declare queues for services it interacts with (Feeder, Fetcher, Writer)
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqFeederQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResFeederQueue);
-                _rabbitMqService.DeclareQueueWithDeadLetter("req_fetcher");
-                _rabbitMqService.DeclareQueueWithDeadLetter("res_fetcher");
+                _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqFetcherQueue);
+                _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResFetcherQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqWriterQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResWriterQueue);
 
                 // Purge all queues before starting orchestration
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqFeederQueue);
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ResFeederQueue);
-                _rabbitMqService.PurgeQueue("req_fetcher");
-                _rabbitMqService.PurgeQueue("res_fetcher");
+                _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqFetcherQueue);
+                _rabbitMqService.PurgeQueue(RabbitMqConfig.ResFetcherQueue);
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqWriterQueue);
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ResWriterQueue);
 
                 // Set up Consumers:
                 _rabbitMqService.Consume<FeederResponse>(RabbitMqConfig.ResFeederQueue, OnFeederResponseReceived, autoAck: false);
-                _rabbitMqService.Consume<FetcherResponse>("res_fetcher", OnFetcherResponseReceived, autoAck: false);
+                _rabbitMqService.Consume<FetcherResponse>(RabbitMqConfig.ResFetcherQueue, OnFetcherResponseReceived, autoAck: false);
                 _rabbitMqService.Consume<WriterResponse>(RabbitMqConfig.ResWriterQueue, OnWriterResponseReceived, autoAck: false);
 
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for feeder responses on '{RabbitMqConfig.ResFeederQueue}'");
-                _logger.LogInformation($"be_wrk_orchestrator: Listening for fetcher responses on 'res_fetcher'");
+                _logger.LogInformation($"be_wrk_orchestrator: Listening for fetcher responses on '{RabbitMqConfig.ResFetcherQueue}'");
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for writer responses on '{RabbitMqConfig.ResWriterQueue}'");
 
                 // Use the helper for the initial orchestration
@@ -137,7 +137,7 @@ namespace be_wrk_orchestrator
 
                     state.CurrentStep = "Requesting Fetcher Data";
                     await _redisDatabase.StringSetAsync(correlationIdString, JsonSerializer.Serialize(state));
-                    await _rabbitMqService.PublishAsync("req_fetcher", fetcherCommand);
+                    await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFetcherQueue, fetcherCommand);
                     _rabbitMqService.Ack(context.DeliveryTag);
                     _logger.LogInformation($"be_wrk_orchestrator: [->] Published FetcherCommand for CorrelationId: {correlationIdString}");
                 }
@@ -301,7 +301,7 @@ namespace be_wrk_orchestrator
             {
                 CurrentStep = "Orchestrator Initiating Feeder Command"
             };
-            await _redisDatabase.StringSetAsync(correlationId.ToString(), JsonSerializer.Serialize(state));
+            await _redisDatabase.StringSetAsync(correlationId.ToString(), JsonSerializer.Serialize(state), TimeSpan.FromMinutes(30));
             await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, feederCommand);
             _logger.LogInformation($"be_wrk_orchestrator: [->] FeederCommand with CorrelationId: {correlationId} published to '{RabbitMqConfig.ReqFeederQueue}'.");
         }
