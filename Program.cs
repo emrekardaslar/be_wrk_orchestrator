@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
+using StackExchange.Redis;
 
 // --- USING DIRECTIVES ---
 using be_wrk_orchestrator; // To find OrchestratorWorker
@@ -29,6 +30,10 @@ namespace be_wrk_orchestrator
                 {
                     // Register our custom RabbitMQ service
                     services.AddRabbitMqService();
+
+                    // --- Add Redis Connection --- //
+                    services.AddSingleton<IConnectionMultiplexer>(sp => 
+                        ConnectionMultiplexer.Connect(hostContext.Configuration.GetConnectionString("Redis")));
 
                     // Register our OrchestratorWorker as a hosted service
                     services.AddHostedService<OrchestratorWorker>();

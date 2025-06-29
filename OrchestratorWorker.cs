@@ -1,10 +1,12 @@
+
 // be_wrk_orchestrator/OrchestratorWorker.cs
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Concurrent; // For ConcurrentDictionary
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using StackExchange.Redis;
 
 // --- USING DIRECTIVES FOR core_lib_messaging ---
 using core_lib_messaging.Models;
@@ -17,29 +19,25 @@ namespace be_wrk_orchestrator
     {
         private readonly ILogger<OrchestratorWorker> _logger;
         private readonly IRabbitMqService _rabbitMqService;
-        // Using ConcurrentDictionary for in-memory state management.
-        // The key for this dictionary MUST be string, so CorrelationId (Guid) must be converted to string.
-        private readonly ConcurrentDictionary<string, OrchestrationState> _orchestrationStates;
+        private readonly IDatabase _redisDatabase;
 
-        public OrchestratorWorker(ILogger<OrchestratorWorker> logger, IRabbitMqService rabbitMqService)
+        public OrchestratorWorker(ILogger<OrchestratorWorker> logger, IRabbitMqService rabbitMqService, IConnectionMultiplexer redisConnection)
         {
             _logger = logger;
             _rabbitMqService = rabbitMqService;
-            _orchestrationStates = new ConcurrentDictionary<string, OrchestrationState>();
+            _redisDatabase = redisConnection.GetDatabase();
         }
 
         // Represents the state of an ongoing orchestration workflow
         private class OrchestrationState
         {
             public FeederResponse? FeederResponse { get; set; }
+            public List<string> Ids { get; set; } = new List<string>();
             public DateTime StartTime { get; } = DateTime.UtcNow;
             public string CurrentStep { get; set; } = "Initialized";
             public bool IsCompleted { get; set; } = false;
             public bool IsSuccessful { get; set; } = false;
             public string? ErrorMessage { get; set; }
-            // As discussed, OrchestratorResponse publishing needs a ReplyToQueue,
-            // which would ideally come from an initial trigger message.
-            // Since Orchestrator initiates, there's no external ReplyToQueue to use unless hardcoded.
         }
 
         public override Task StartAsync(CancellationToken cancellationToken)
@@ -48,23 +46,29 @@ namespace be_wrk_orchestrator
 
             try
             {
-                // Declare queues for services it interacts with (Feeder, Writer)
+                // Declare queues for services it interacts with (Feeder, Fetcher, Writer)
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqFeederQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResFeederQueue);
+                _rabbitMqService.DeclareQueueWithDeadLetter("req_fetcher");
+                _rabbitMqService.DeclareQueueWithDeadLetter("res_fetcher");
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ReqWriterQueue);
                 _rabbitMqService.DeclareQueueWithDeadLetter(RabbitMqConfig.ResWriterQueue);
 
                 // Purge all queues before starting orchestration
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqFeederQueue);
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ResFeederQueue);
+                _rabbitMqService.PurgeQueue("req_fetcher");
+                _rabbitMqService.PurgeQueue("res_fetcher");
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ReqWriterQueue);
                 _rabbitMqService.PurgeQueue(RabbitMqConfig.ResWriterQueue);
 
                 // Set up Consumers:
                 _rabbitMqService.Consume<FeederResponse>(RabbitMqConfig.ResFeederQueue, OnFeederResponseReceived, autoAck: false);
+                _rabbitMqService.Consume<FetcherResponse>("res_fetcher", OnFetcherResponseReceived, autoAck: false);
                 _rabbitMqService.Consume<WriterResponse>(RabbitMqConfig.ResWriterQueue, OnWriterResponseReceived, autoAck: false);
 
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for feeder responses on '{RabbitMqConfig.ResFeederQueue}'");
+                _logger.LogInformation($"be_wrk_orchestrator: Listening for fetcher responses on 'res_fetcher'");
                 _logger.LogInformation($"be_wrk_orchestrator: Listening for writer responses on '{RabbitMqConfig.ResWriterQueue}'");
 
                 // Use the helper for the initial orchestration
@@ -84,15 +88,7 @@ namespace be_wrk_orchestrator
             _logger.LogInformation("be_wrk_orchestrator: Orchestrator Worker running. Press Ctrl+C to stop.");
             while (!stoppingToken.IsCancellationRequested)
             {
-                // Orchestrator primarily reacts to messages, so the ExecuteAsync
-                // loop can simply delay, waiting for cancellation.
                 await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
-
-                // Periodically log current ongoing orchestrations (optional for debugging)
-                if (_orchestrationStates.Count > 0)
-                {
-                    _logger.LogDebug($"be_wrk_orchestrator: Currently tracking {_orchestrationStates.Count} ongoing orchestrations.");
-                }
             }
             _logger.LogInformation("be_wrk_orchestrator: Orchestrator Worker detected cancellation request.");
         }
@@ -104,13 +100,8 @@ namespace be_wrk_orchestrator
             return base.StopAsync(cancellationToken);
         }
 
-        /// <summary>
-        /// Handler for responses from the Feeder Service.
-        /// This method will now always receive a response for an orchestration initiated by the orchestrator itself.
-        /// </summary>
         private async Task OnFeederResponseReceived(FeederResponse? response, MessageDeliveryContext context)
         {
-            // Ensure response and CorrelationId are valid. CorrelationId in BaseMessage is a Guid.
             if (response == null || response.CorrelationId == Guid.Empty)
             {
                 _logger.LogWarning("be_wrk_orchestrator: [!] Error: Received null or malformed FeederResponse (invalid CorrelationId). Nacking.");
@@ -118,65 +109,104 @@ namespace be_wrk_orchestrator
                 return;
             }
 
-            // Convert CorrelationId (Guid) to string for dictionary lookup and logging
             string correlationIdString = response.CorrelationId.ToString();
-            OrchestrationState? state;
-
-            // The state *should* now always exist because the orchestrator initiated it in StartAsync.
-            // If it doesn't, it indicates an unexpected message or an issue.
-            if (!_orchestrationStates.TryGetValue(correlationIdString, out state))
+            var stateJson = await _redisDatabase.StringGetAsync(correlationIdString);
+            if (stateJson.IsNullOrEmpty)
             {
-                _logger.LogWarning($"be_wrk_orchestrator: [!] Received FeederResponse for unknown CorrelationId: {correlationIdString}. This should only happen if another service initiated it or after completion. Nacking.");
+                _logger.LogWarning($"be_wrk_orchestrator: [!] Received FeederResponse for unknown CorrelationId: {correlationIdString}. Nacking.");
                 _rabbitMqService.Nack(context.DeliveryTag, requeue: false);
                 return;
             }
 
+            var state = JsonSerializer.Deserialize<OrchestrationState>(stateJson);
             _logger.LogInformation($"be_wrk_orchestrator: [<-] Received FeederResponse for CorrelationId: {correlationIdString}. IsSuccess: {response.IsSuccess}. Current Step: {state.CurrentStep}");
 
-            state.FeederResponse = response; // Store feeder response in state
+            state.FeederResponse = response;
+            state.Ids = response.Ids;
             state.CurrentStep = "Processing Feeder Response";
 
             try
             {
                 if (response.IsSuccess)
                 {
-                    if (string.IsNullOrEmpty(response.FetchedData))
+                    var fetcherCommand = new FetcherCommand
                     {
-                        _logger.LogWarning($"be_wrk_orchestrator: [!] Feeder returned success but no data for CorrelationId: {correlationIdString}. Proceeding with empty data to writer.");
-                        // In a real scenario, you might have specific logic for empty data (e.g., skip writer, fail orchestration).
-                    }
-
-                    // Send command to Writer
-                    var writerCommand = new WriterCommand
-                    {
-                        CorrelationId = response.CorrelationId, // CorrelationId on WriterCommand should match the Guid type
-                        DataToPersist = response.FetchedData // Pass fetched data to writer
+                        CorrelationId = response.CorrelationId,
+                        Ids = response.Ids
                     };
 
-                    state.CurrentStep = "Requesting Writer Data";
-                    await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqWriterQueue, writerCommand);
-                    _rabbitMqService.Ack(context.DeliveryTag); // Acknowledge the feeder response
-                    _logger.LogInformation($"be_wrk_orchestrator: [->] Published WriterCommand for CorrelationId: {correlationIdString}");
+                    state.CurrentStep = "Requesting Fetcher Data";
+                    await _redisDatabase.StringSetAsync(correlationIdString, JsonSerializer.Serialize(state));
+                    await _rabbitMqService.PublishAsync("req_fetcher", fetcherCommand);
+                    _rabbitMqService.Ack(context.DeliveryTag);
+                    _logger.LogInformation($"be_wrk_orchestrator: [->] Published FetcherCommand for CorrelationId: {correlationIdString}");
                 }
                 else
                 {
                     _logger.LogWarning($"be_wrk_orchestrator: [!] Feeder step failed for CorrelationId: {correlationIdString}. Error: {response.ErrorMessage}");
-                    HandleOrchestrationFailure(correlationIdString, $"Feeder step failed: {response.ErrorMessage}", context.DeliveryTag, requeueOriginal: false);
+                    await HandleOrchestrationFailure(correlationIdString, $"Feeder step failed: {response.ErrorMessage}", context.DeliveryTag, requeueOriginal: false);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"be_wrk_orchestrator: [!] Error processing FeederResponse or publishing WriterCommand for CorrelationId: {correlationIdString}.");
-                HandleOrchestrationFailure(correlationIdString, $"Orchestrator internal error after Feeder response: {ex.Message}", context.DeliveryTag, requeueOriginal: false);
+                _logger.LogError(ex, $"be_wrk_orchestrator: [!] Error processing FeederResponse or publishing FetcherCommand for CorrelationId: {correlationIdString}.");
+                await HandleOrchestrationFailure(correlationIdString, $"Orchestrator internal error after Feeder response: {ex.Message}", context.DeliveryTag, requeueOriginal: false);
             }
         }
 
-        /// <summary>
-        /// Handler for responses from the Writer Service. Finalizes the workflow.
-        /// </summary>
+        private async Task OnFetcherResponseReceived(FetcherResponse? response, MessageDeliveryContext context)
+        {
+            if (response == null || response.CorrelationId == Guid.Empty)
+            {
+                _logger.LogWarning("be_wrk_orchestrator: [!] Error: Received null or malformed FetcherResponse (invalid CorrelationId). Nacking.");
+                _rabbitMqService.Nack(context.DeliveryTag, requeue: false);
+                return;
+            }
+
+            string correlationIdString = response.CorrelationId.ToString();
+            var stateJson = await _redisDatabase.StringGetAsync(correlationIdString);
+            if (stateJson.IsNullOrEmpty)
+            {
+                _logger.LogWarning($"be_wrk_orchestrator: [!] Received FetcherResponse for unknown CorrelationId: {correlationIdString}. Nacking.");
+                _rabbitMqService.Nack(context.DeliveryTag, requeue: false);
+                return;
+            }
+
+            var state = JsonSerializer.Deserialize<OrchestrationState>(stateJson);
+            _logger.LogInformation($"be_wrk_orchestrator: [<-] Received FetcherResponse for CorrelationId: {correlationIdString}. IsSuccess: {response.IsSuccess}. Current Step: {state.CurrentStep}");
+
+            state.CurrentStep = "Processing Fetcher Response";
+
+            try
+            {
+                if (response.IsSuccess)
+                {
+                    var writerCommand = new WriterCommand
+                    {
+                        CorrelationId = response.CorrelationId
+                    };
+
+                    state.CurrentStep = "Requesting Writer Data";
+                    await _redisDatabase.StringSetAsync(correlationIdString, JsonSerializer.Serialize(state));
+                    await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqWriterQueue, writerCommand);
+                    _rabbitMqService.Ack(context.DeliveryTag);
+                    _logger.LogInformation($"be_wrk_orchestrator: [->] Published WriterCommand for CorrelationId: {correlationIdString}");
+                }
+                else
+                {
+                    _logger.LogWarning($"be_wrk_orchestrator: [!] Fetcher step failed for CorrelationId: {correlationIdString}. Error: {response.ErrorMessage}");
+                    await HandleOrchestrationFailure(correlationIdString, $"Fetcher step failed: {response.ErrorMessage}", context.DeliveryTag, requeueOriginal: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"be_wrk_orchestrator: [!] Error processing FetcherResponse or publishing WriterCommand for CorrelationId: {correlationIdString}.");
+                await HandleOrchestrationFailure(correlationIdString, $"Orchestrator internal error after Fetcher response: {ex.Message}", context.DeliveryTag, requeueOriginal: false);
+            }
+        }
+
         private async Task OnWriterResponseReceived(WriterResponse? response, MessageDeliveryContext context)
         {
-            // Ensure response and CorrelationId are valid. CorrelationId in BaseMessage is a Guid.
             if (response == null || response.CorrelationId == Guid.Empty)
             {
                 _logger.LogWarning("be_wrk_orchestrator: [!] Error: Received null or malformed WriterResponse (invalid CorrelationId). Nacking.");
@@ -184,20 +214,19 @@ namespace be_wrk_orchestrator
                 return;
             }
 
-            // Convert CorrelationId (Guid) to string for dictionary lookup and logging
             string correlationIdString = response.CorrelationId.ToString();
-
-            // Try to remove the state as this is the final step in this orchestration
-            if (!_orchestrationStates.TryRemove(correlationIdString, out var state))
+            var stateJson = await _redisDatabase.StringGetAsync(correlationIdString);
+            if (stateJson.IsNullOrEmpty)
             {
-                _logger.LogWarning($"be_wrk_orchestrator: [!] Received WriterResponse for unknown or already completed CorrelationId: {correlationIdString}. Nacking.");
+                 _logger.LogWarning($"be_wrk_orchestrator: [!] Received WriterResponse for unknown or already completed CorrelationId: {correlationIdString}. Nacking.");
                 _rabbitMqService.Nack(context.DeliveryTag, requeue: false);
                 return;
             }
+            await _redisDatabase.KeyDeleteAsync(correlationIdString);
 
+            var state = JsonSerializer.Deserialize<OrchestrationState>(stateJson);
             _logger.LogInformation($"be_wrk_orchestrator: [<-] Received WriterResponse for CorrelationId: {correlationIdString}. IsSuccess: {response.IsSuccess}");
 
-            // Finalize orchestration state
             state.IsCompleted = true;
             state.CurrentStep = "Completed";
 
@@ -224,13 +253,9 @@ namespace be_wrk_orchestrator
 
             try
             {
-                // As discussed, the OrchestratorResponse is not published to a dedicated queue
-                // and lacks a ReplyToQueue property in BaseMessage to send dynamically.
-                // It's currently not being sent externally.
                 _logger.LogInformation($"be_wrk_orchestrator: [->] Orchestration process completed for CorrelationId: {correlationIdString}. Final response not published to a dedicated orchestrator queue as per design.");
-                _rabbitMqService.Ack(context.DeliveryTag); // Acknowledge writer response message
+                _rabbitMqService.Ack(context.DeliveryTag);
 
-                // Use the helper for the next orchestration
                 await StartNewOrchestration($"ChainedProcess_{DateTime.Now:yyyyMMddHHmmss}");
             }
             catch (Exception ex)
@@ -239,46 +264,28 @@ namespace be_wrk_orchestrator
             }
         }
 
-        /// <summary>
-        /// Helper method to handle failures in the orchestration flow and publish a final failure response.
-        /// </summary>
-        /// <param name="correlationId">The correlation ID as a string (since it's used as a dictionary key).</param>
-        private async void HandleOrchestrationFailure(string correlationId, string errorMessage, ulong deliveryTag, bool requeueOriginal)
+        private async Task HandleOrchestrationFailure(string correlationId, string errorMessage, ulong deliveryTag, bool requeueOriginal)
         {
-            // Try to remove the state if it exists. The 'correlationId' parameter here is already a string.
-            if (_orchestrationStates.TryRemove(correlationId, out var state))
+            await _redisDatabase.KeyDeleteAsync(correlationId);
+            _logger.LogError($"be_wrk_orchestrator: Orchestration FAILED for CorrelationId: {correlationId}. Reason: {errorMessage}");
+
+            _rabbitMqService.Nack(deliveryTag, requeueOriginal);
+
+            var orchestrationResponse = new OrchestratorResponse
             {
-                state.IsCompleted = true;
-                state.IsSuccessful = false;
-                state.ErrorMessage = errorMessage;
-                state.CurrentStep = "Failed";
-                _logger.LogError($"be_wrk_orchestrator: Orchestration FAILED for CorrelationId: {correlationId}. Reason: {errorMessage}");
+                CorrelationId = Guid.Parse(correlationId),
+                IsSuccess = false,
+                FinalMessage = "Orchestration failed due to an internal error or a step failure.",
+                ErrorDetails = errorMessage
+            };
 
-                // Nack the current message that triggered the failure (e.g., failed FeederResponse)
-                _rabbitMqService.Nack(deliveryTag, requeueOriginal);
-
-                // Publish a final failure response (currently not sent externally as per design constraints)
-                var orchestrationResponse = new OrchestratorResponse
-                {
-                    CorrelationId = Guid.Parse(correlationId),
-                    IsSuccess = false,
-                    FinalMessage = "Orchestration failed due to an internal error or a step failure.",
-                    ErrorDetails = errorMessage
-                };
-
-                try
-                {
-                    _logger.LogInformation($"be_wrk_orchestrator: [->] Orchestration FAILED for CorrelationId: {correlationId}. Final error response not published to a dedicated orchestrator queue as per design.");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"be_wrk_orchestrator: [!] Error processing or finalizing FAILED Orchestration for CorrelationId: {correlationId}.");
-                }
+            try
+            {
+                _logger.LogInformation($"be_wrk_orchestrator: [->] Orchestration FAILED for CorrelationId: {correlationId}. Final error response not published to a dedicated orchestrator queue as per design.");
             }
-            else
+            catch (Exception ex)
             {
-                _logger.LogWarning($"be_wrk_orchestrator: Tried to handle failure for unknown or already processed CorrelationId: {correlationId}. Nacking current message.");
-                _rabbitMqService.Nack(deliveryTag, requeueOriginal); // Still nack the message even if state not found
+                _logger.LogError(ex, $"be_wrk_orchestrator: [!] Error processing or finalizing FAILED Orchestration for CorrelationId: {correlationId}.");
             }
         }
 
@@ -294,7 +301,7 @@ namespace be_wrk_orchestrator
             {
                 CurrentStep = "Orchestrator Initiating Feeder Command"
             };
-            _orchestrationStates.TryAdd(correlationId.ToString(), state);
+            await _redisDatabase.StringSetAsync(correlationId.ToString(), JsonSerializer.Serialize(state));
             await _rabbitMqService.PublishAsync(RabbitMqConfig.ReqFeederQueue, feederCommand);
             _logger.LogInformation($"be_wrk_orchestrator: [->] FeederCommand with CorrelationId: {correlationId} published to '{RabbitMqConfig.ReqFeederQueue}'.");
         }
